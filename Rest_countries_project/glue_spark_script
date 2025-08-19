@@ -1,0 +1,68 @@
+import sys
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import from_json, col
+from pyspark.sql.types import StructType, StringType, IntegerType, BooleanType
+from awsglue.dynamicframe import DynamicFrame
+
+# Initialize Glue and Spark context
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+# Initialize job (replace with job parameters if needed)
+job.init("kafka_to_s3_with_logs", {})
+
+# Define schema for your JSON Kafka message
+schema = StructType()
+    .add("name", StringType())
+    .add("official_name", StringType())
+    .add("capital", StringType())
+    .add("region", StringType())
+    .add("subregion", StringType())
+    .add("population", IntegerType())
+    .add("area_km2", IntegerType())
+    .add("independent", BooleanType())
+    .add("un_member", BooleanType())
+    .add("languages", StringType())
+    .add("currencies", StringType())
+    .add("flag", StringType())
+
+# Read from Kafka topic
+kafka_df = spark.read
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "Your instance private-ip")
+    .option("subscribe", "Your Kafka-topic")
+    .option("startingOffsets", "earliest")
+    .load()
+
+# Extract and parse JSON from Kafka "value"
+parsed_df = kafka_df.selectExpr("CAST(value AS STRING) AS json_str")
+    .withColumn("data", from_json(col("json_str"), schema))
+    .select("data.*")
+    .filter(col("name").isNotNull())  # filter out malformed data
+
+# Show logs in CloudWatch
+print("==== Parsed Schema ====")
+parsed_df.printSchema()
+
+print("==== Sample Records ====")
+parsed_df.show(10, truncate=False)
+
+# Convert DataFrame to DynamicFrame for Glue writing
+dynamic_frame = DynamicFrame.fromDF(parsed_df, glueContext, "dynamic_frame")
+
+# Write to S3 in CSV format
+glueContext.write_dynamic_frame.from_options(
+    frame=dynamic_frame,
+    connection_type="s3",
+    connection_options={
+        "path": "s3://Your S3-Bucket name/kafka-output/",
+        "partitionKeys": []  # You can add ["region", "capital"] etc. if needed
+    },
+    format="csv"
+)
+
+job.commit()

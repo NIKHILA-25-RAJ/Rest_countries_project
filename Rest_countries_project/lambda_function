@@ -1,0 +1,70 @@
+import os
+import json
+import urllib3
+
+http = urllib3.PoolManager()
+
+def lambda_handler(event, context):
+    base_url = os.environ.get("REST_COUNTRIES_API","https://restcountries.com/v3.1")
+    flask_api_url = "http://Your instance public ip:5000/produce"  
+
+    # List of countries to fetch
+    countries = event.get("countries", ["India", "United States", "Brazil", "Pakistan","China","Argentina","Austalia","Bhutan","Afghanistan","Japan","Canada"])
+   
+    result = []
+   
+    for country in countries:
+        url = f"{base_url}/name/{country}"
+        response = http.request("GET", url)
+       
+        if response.status == 200:
+            try:
+                raw_data = json.loads(response.data.decode("utf-8"))
+                entry = raw_data[0]
+
+                country_info = {
+                    "name": entry.get("name", {}).get("common", ""),
+                    "official_name": entry.get("name", {}).get("official", ""),
+                    "capital": entry.get("capital", [""])[0],
+                    "region": entry.get("region", ""),
+                    "subregion": entry.get("subregion", ""),
+                    "population": entry.get("population", 0),
+                    "area_km2": entry.get("area", 0),
+                    "independent": entry.get("independent", False),
+                    "un_member": entry.get("unMember", False),
+                    "languages": ", ".join(entry.get("languages", {}).values()),
+                    "currencies": ", ".join(
+                        [f"{v.get('name')} ({k})" for k, v in entry.get("currencies", {}).items()]
+                    ),
+                    "flag": entry.get("flags", {}).get("png", "")
+                }
+
+                #  Send this country info to Flask Kafka API on EC2
+                kafka_payload = json.dumps({
+                    "topic": "Your-Kafka-topic",
+                    "message": country_info
+                }).encode("utf-8")
+
+                kafka_response = http.request(
+                    "POST",
+                    flask_api_url,
+                    body=kafka_payload,
+                    headers={"Content-Type": "application/json"}
+                )
+
+                # Append both info + Kafka status
+                result.append({
+                    "country": country_info,
+                    "kafka_status": kafka_response.status
+                })
+
+            except Exception as e:
+                result.append({"error": f"Parsing failed for {country}: {str(e)}"})
+        else:
+            result.append({"error": f"Failed to fetch data for {country}"})
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(result)
+    }
+
