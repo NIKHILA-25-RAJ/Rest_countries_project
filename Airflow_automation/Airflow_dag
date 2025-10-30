@@ -1,0 +1,125 @@
+from airflow import DAG
+from airflow.providers.amazon.aws.operators.lambda_function import LambdaInvokeFunctionOperator
+from airflow.operators.python import PythonOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.providers.snowflake.operators.snowflake import SQLExecuteQueryOperator
+from datetime import datetime, timedelta
+from kafka import KafkaProducer
+import json
+
+# Dag settings
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=1),
+}
+
+
+# Kafka config
+
+KAFKA_BROKER = "localhost:9092"
+KAFKA_TOPIC = "your kafka topic"
+
+
+# Function: Send to Kafka
+
+def send_to_kafka(**context):
+    lambda_response = context['ti'].xcom_pull(task_ids='invoke_lambda')
+    if not lambda_response:
+        raise Exception("No data received from Lambda function")
+
+    payload = json.loads(lambda_response)
+    body = json.loads(payload.get('body', '{}'))
+    countries_data = body.get('countries_data', [])
+
+    if not countries_data:
+        raise Exception("No data to send to Kafka")
+
+    print(f"Sending {len(countries_data)} records to Kafka...")
+
+    producer = KafkaProducer(
+        bootstrap_servers=[KAFKA_BROKER],
+        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+    )
+
+    for record in countries_data:
+        producer.send(KAFKA_TOPIC, value=record)
+
+    producer.flush()
+    producer.close()
+    print(" Data successfully sent to Kafka!")
+
+
+# DAG Definition
+
+with DAG(
+    dag_id='lambda_kafka_spark_s3_dag',
+    default_args=default_args,
+    description='Fetch data from Lambda, send to Kafka, transform with Spark, and store in S3',
+    schedule_interval=None,
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=['lambda', 'kafka', 'spark', 's3'],
+) as dag:
+
+    # Task 1: Invoke Lambda
+    invoke_lambda = LambdaInvokeFunctionOperator(
+        task_id='invoke_lambda',
+        function_name='your lambda name',  
+        invocation_type='RequestResponse',
+        aws_conn_id='aws_default',
+        log_type='Tail',
+    )
+
+    # Task 2: Send to Kafka
+    send_to_kafka_task = PythonOperator(
+        task_id='send_to_kafka',
+        python_callable=send_to_kafka,
+        provide_context=True,
+    )
+
+    spark_transform = SparkSubmitOperator(
+        task_id='spark_transform_s3',
+        application='/home/user/airflow/dags/spark_jobs/kafka_s3.py',
+        conn_id='spark_default',
+        packages='org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262',
+        
+        conf={
+            "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+            "spark.hadoop.fs.s3a.aws.credentials.provider": "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
+            "spark.hadoop.fs.s3a.endpoint": "s3.amazonaws.com"
+        },
+        
+        env_vars={  #  Pass AWS creds from Airflow Connection
+            "AWS_ACCESS_KEY_ID": "{{ conn.aws_default.login }}",
+            "AWS_SECRET_ACCESS_KEY": "{{ conn.aws_default.password }}",
+        },  
+        application_args=[
+            "localhost:9092",        # Kafka broker
+            "your kafka topic",         # Kafka topic
+            "s3a://your bucket path/"  # S3 path
+        ],
+        verbose=True,
+        dag=dag
+    )
+     
+    load_to_snowflake = SQLExecuteQueryOperator(
+    task_id='load_to_snowflake',
+    conn_id='snowflake_default',  
+    sql="""
+        USE WAREHOUSE etl_wh;
+        USE DATABASE countries_db;
+        USE SCHEMA etl;
+        
+        COPY INTO countries_data
+        FROM @s3_stage
+        FILE_FORMAT = (TYPE = 'CSV' SKIP_HEADER = 1 FIELD_OPTIONALLY_ENCLOSED_BY = '"')
+        ON_ERROR = 'CONTINUE';
+    """,
+    )
+
+    # Dependencies
+    invoke_lambda >> send_to_kafka_task >> spark_transform >> load_to_snowflake

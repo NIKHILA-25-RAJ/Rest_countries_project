@@ -1,0 +1,98 @@
+import os
+import json
+import urllib3
+
+http = urllib3.PoolManager()
+
+def lambda_handler(event, context):
+    base_url = os.environ.get("REST_COUNTRIES_API", "https://restcountries.com/v3.1")
+    
+    # List of countries to fetch - expanded list
+    countries = event.get("countries", [
+        "India", "United States", "Brazil", "Pakistan", "China", 
+        "Argentina", "Australia", "Bhutan", "Afghanistan", "Japan", 
+        "Canada", "Germany", "France", "United Kingdom", "Russia",
+        "Italy", "Spain", "Mexico", "South Africa", "Egypt",
+        "Nigeria", "Kenya", "Sri Lanka", "Bangladesh", "Nepal"
+    ])
+   
+    result = []
+    successful_countries = 0
+    failed_countries = 0
+    
+    for country in countries:
+        try:
+            url = f"{base_url}/name/{country}"
+            print(f"Fetching data for: {country}")
+            
+            response = http.request("GET", url)
+           
+            if response.status == 200:
+                try:
+                    raw_data = json.loads(response.data.decode("utf-8"))
+                    
+                    # Handle case where multiple countries might match
+                    if not raw_data:
+                        result.append({"error": f"No data found for {country}"})
+                        failed_countries += 1
+                        continue
+                    
+                    entry = raw_data[0]  # Take first match
+
+                    country_info = {
+                        "name": entry.get("name", {}).get("common", ""),
+                        "official_name": entry.get("name", {}).get("official", ""),
+                        "capital": entry.get("capital", [""])[0] if entry.get("capital") else "N/A",
+                        "region": entry.get("region", ""),
+                        "subregion": entry.get("subregion", ""),
+                        "population": entry.get("population", 0),
+                        "area_km2": entry.get("area", 0),
+                        "independent": entry.get("independent", False),
+                        "un_member": entry.get("unMember", False),
+                        "languages": ", ".join(entry.get("languages", {}).values()) if entry.get("languages") else "N/A",
+                        "currencies": ", ".join(
+                            [f"{v.get('name', '')} ({k})" for k, v in entry.get("currencies", {}).items()]
+                        ) if entry.get("currencies") else "N/A",
+                        "flag": entry.get("flags", {}).get("png", ""),
+                        "timezones": entry.get("timezones", []),
+                        "borders": entry.get("borders", [])
+                    }
+
+                    result.append({
+                        "country": country,
+                        "data": country_info,
+                        "status": "success"
+                    })
+                    
+                    successful_countries += 1
+                    print(f"Successfully processed: {country}")
+
+                except IndexError:
+                    result.append({"error": f"No valid data found for {country}", "status": "failed"})
+                    failed_countries += 1
+                except Exception as e:
+                    result.append({"error": f"Parsing failed for {country}: {str(e)}", "status": "failed"})
+                    failed_countries += 1
+            else:
+                result.append({"error": f"API failed for {country} with status {response.status}", "status": "failed"})
+                failed_countries += 1
+                
+        except Exception as e:
+            result.append({"error": f"Request failed for {country}: {str(e)}", "status": "failed"})
+            failed_countries += 1
+
+    # Summary
+    summary = {
+        "total_countries_processed": len(countries),
+        "successful": successful_countries,
+        "failed": failed_countries,
+        "success_rate": f"{(successful_countries/len(countries))*100:.2f}%"
+    }
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "summary": summary,
+            "countries_data": result
+        })
+    }

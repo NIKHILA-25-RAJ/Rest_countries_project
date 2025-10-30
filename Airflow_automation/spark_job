@@ -1,0 +1,39 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, trim
+import sys
+
+if __name__ == "__main__":
+    spark = SparkSession.builder \
+        .appName("KafkaToS3Transformation") \
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain") \
+        .config("spark.hadoop.fs.s3a.endpoint", "s3.amazonaws.com") \
+        .getOrCreate()
+
+    kafka_broker = sys.argv[1]
+    topic = sys.argv[2]
+    s3_path = sys.argv[3]
+
+    df = spark.read.format("kafka") \
+        .option("kafka.bootstrap.servers", kafka_broker) \
+        .option("subscribe", topic) \
+        .load()
+
+    json_df = df.selectExpr("CAST(value AS STRING) as json_value")
+    parsed_df = spark.read.json(json_df.rdd.map(lambda r: r.json_value))
+
+    clean_df = parsed_df.select(
+        trim((col("country"))).alias("country_name"),
+        col("data.region").alias("region"),
+        col("data.population").alias("population"),
+        col("data.capital").alias("capital"),
+        col("data.official_name").alias("official_name")
+    ).dropDuplicates(["country_name", "capital", "official_name"])
+
+    
+    clean_df.coalesce(1).write.mode("overwrite").option("header", True).csv(s3_path)
+
+    print(f"Successfully written to S3: {s3_path}")
+    spark.stop()
+
+
